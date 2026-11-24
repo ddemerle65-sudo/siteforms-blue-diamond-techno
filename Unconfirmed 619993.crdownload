@@ -1,0 +1,410 @@
+/* SiteForms – photo & document attachments (camera capture, upload, stamping, viewer, evidence rules) */
+(function (root) {
+  'use strict';
+  const U = root.U, R = root.Render;
+  const A = {};
+  const MAX_EDGE = 1600, THUMB = 240, MAX_PDF = 30 * 1048576;
+
+  /* ---------------- model helpers ---------------- */
+  A.all = (rec) => (rec.att = rec.att || []);
+  A.list = (rec, sheet, item) => A.all(rec).filter((a) => a.sheet === sheet && (item === undefined || String(a.item == null ? '' : a.item) === String(item == null ? '' : item)));
+  /** checklist items on a sheet (rows that hold YES/NA choices) */
+  A.items = (sm) => {
+    const out = [], seen = {};
+    (sm.order || []).forEach((ad) => {
+      const f = sm.fields[ad];
+      if (!f || !f.row || !f.q || seen[f.row]) return;
+      if (!Object.values(sm.fields).some((x) => x.row === f.row && x.type === 'choice')) return;
+      seen[f.row] = 1; out.push({ key: String(f.row), r: f.row, label: f.q, sec: f.sec || '' });
+    });
+    return out;
+  };
+  A.itemLabel = (sm, key) => { if (key == null || key === '') return 'General'; const it = A.items(sm).find((i) => i.key === String(key)); return it ? it.label : 'Row ' + key; };
+  A.rule = (sm) => Object.assign({ min: 0, yes: false, rows: {} }, sm.photo || {});
+  /** missing evidence -> [{item, msg}] */
+  A.missing = (tpl, rec, sm) => {
+    const rule = A.rule(sm), out = [];
+    const atts = A.list(rec, sm.name);
+    if (rule.min && atts.length < rule.min) out.push({ item: '', msg: `${rule.min - atts.length} more photo${rule.min - atts.length > 1 ? 's' : ''} / document${rule.min - atts.length > 1 ? 's' : ''} for this form` });
+    A.items(sm).forEach((it) => {
+      let need = !!rule.rows[it.key];
+      if (!need && rule.yes) need = Object.values(sm.fields).some((f) => f.row === it.r && f.type === 'choice' && /^yes$/i.test(String(R.fieldVal(rec, sm, f.addr) || '')));
+      if (need && !atts.some((a) => String(a.item) === it.key)) out.push({ item: it.key, msg: 'Photo for ' + it.label.replace(/\s+/g, ' ').slice(0, 60) });
+    });
+    return out;
+  };
+  A.needItem = (tpl, rec, sm, key) => A.missing(tpl, rec, sm).some((m) => m.item === String(key));
+  A.hashes = (rec, sheet) => A.list(rec, sheet).map((a) => a.hash);
+
+  /* ---------------- storage ---------------- */
+  A.getData = (id) => U.get('files', id);
+  A.dataUrl = async (att) => { const f = await A.getData(att.id); return f ? U.dataUrlFromBuf(f.data, f.type) : null; };
+  A.blob = async (att) => { const f = await A.getData(att.id); return f ? new Blob([f.data], { type: f.type }) : null; };
+  A.removeRec = async (rec) => { for (const a of A.all(rec)) await U.del('files', a.id); };
+
+  /* ---------------- capture / processing ---------------- */
+  /** GPS is always attempted on every photo - this is a trust/verification feature, not a
+   * convenience setting, so it is never gated behind a user-facing on/off switch. When a
+   * position truly cannot be obtained (location services off at the OS level, no signal,
+   * permission denied) the record still saves, but it carries *why* GPS is missing so that
+   * is visible to whoever reviews the record later, rather than just a silent blank. */
+  A.gps = () => new Promise((res) => {
+    if (!navigator.geolocation) return res({ status: 'unavailable' });
+    let done = false; const fin = (v) => { if (!done) { done = true; res(v); } };
+    setTimeout(() => fin({ status: 'timeout' }), 6000);
+    try {
+      navigator.geolocation.getCurrentPosition(
+        (p) => fin({ status: 'ok', lat: +p.coords.latitude.toFixed(6), lon: +p.coords.longitude.toFixed(6), acc: Math.round(p.coords.accuracy) }),
+        (e) => fin({ status: e && e.code === 1 ? 'denied' : 'unavailable' }),
+        { enableHighAccuracy: true, timeout: 5500, maximumAge: 60000 }
+      );
+    } catch (e) { fin({ status: 'unavailable' }); }
+  });
+  const loadImg = (file) => new Promise((res, rej) => { const u = URL.createObjectURL(file); const im = new Image(); im.onload = () => { res(im); setTimeout(() => URL.revokeObjectURL(u), 1000); }; im.onerror = () => { URL.revokeObjectURL(u); rej(new Error('This image format is not supported by the browser (try JPEG/PNG)')); }; im.src = u; });
+  const toBuf = (canvas, q) => new Promise((res) => canvas.toBlob((b) => b.arrayBuffer().then(res), 'image/jpeg', q));
+  function stamp(ctx, w, h, lines) {
+    const fs = Math.max(13, Math.round(w / 62)), pad = Math.round(fs * 0.55), lh = Math.round(fs * 1.3);
+    const bh = lines.length * lh + pad * 2;
+    ctx.fillStyle = 'rgba(0,0,0,.58)'; ctx.fillRect(0, h - bh, w, bh);
+    ctx.fillStyle = '#fff'; ctx.font = `600 ${fs}px Arial, sans-serif`; ctx.textBaseline = 'top';
+    lines.forEach((l, i) => { let s = l; while (ctx.measureText(s).width > w - pad * 2 && s.length > 4) s = s.slice(0, -2); if (s !== l) s = s.slice(0, -1) + '…'; ctx.fillText(s, pad, h - bh + pad + i * lh); });
+  }
+  async function processImage(file, ctxInfo, gps) {
+    const im = await loadImg(file);
+    let w = im.naturalWidth, h = im.naturalHeight; const k = Math.min(1, MAX_EDGE / Math.max(w, h)); w = Math.round(w * k); h = Math.round(h * k);
+    const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d');
+    x.drawImage(im, 0, 0, w, h);
+    if (U.settings().stamp !== false) {
+      const l2 = [new Date().toLocaleString(), U.settings().user || '', gps && gps.status === 'ok' ? `GPS ${gps.lat}, ${gps.lon} (±${gps.acc} m)` : ''].filter(Boolean).join('  ·  ');
+      stamp(x, w, h, [`${ctxInfo.recName}  ·  ${ctxInfo.sheet}${ctxInfo.itemLabel && ctxInfo.itemLabel !== 'General' ? '  ·  ' + ctxInfo.itemLabel : ''}`, l2]);
+    }
+    const data = await toBuf(c, 0.84);
+    const tk = THUMB / Math.max(w, h); const t = document.createElement('canvas'); t.width = Math.max(1, Math.round(w * tk)); t.height = Math.max(1, Math.round(h * tk));
+    t.getContext('2d').drawImage(c, 0, 0, t.width, t.height);
+    return { data, type: 'image/jpeg', w, h, thumb: t.toDataURL('image/jpeg', 0.72) };
+  }
+  const pdfThumb = (name, pages) => 'data:image/svg+xml;utf8,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="180" height="240" viewBox="0 0 180 240"><rect width="180" height="240" rx="10" fill="#fff" stroke="#cbd5e1" stroke-width="3"/><path d="M130 0v42h50" fill="#e2e8f0"/><rect x="22" y="70" width="136" height="48" rx="8" fill="#dc2626"/><text x="90" y="104" font-family="Arial" font-size="30" font-weight="700" fill="#fff" text-anchor="middle">PDF</text><text x="90" y="150" font-family="Arial" font-size="15" fill="#334155" text-anchor="middle">${U.esc(String(name).slice(0, 20))}</text><text x="90" y="174" font-family="Arial" font-size="14" fill="#64748b" text-anchor="middle">${pages ? pages + ' page' + (pages > 1 ? 's' : '') : ''}</text></svg>`);
+  A.pdfLib = async () => { if (!root.PDFLib) await U.loadScript('pdf-lib.min.js'); return root.PDFLib; };
+
+  /** add files to record; ctx = {tpl, rec, sm, item} */
+  A.addFiles = async (ctx, files) => {
+    files = [...files].filter(Boolean); if (!files.length) return 0;
+    const { rec, sm } = ctx; const item = ctx.item == null ? '' : String(ctx.item);
+    const b = U.busy('Saving attachment…'); let n = 0;
+    try {
+      const gps = files.some((f) => /^image\//.test(f.type) || /\.(jpe?g|png|webp|heic|gif)$/i.test(f.name)) ? await A.gps() : null;
+      const gpsOk = gps && gps.status === 'ok' ? { lat: gps.lat, lon: gps.lon, acc: gps.acc } : undefined;
+      const gpsStatus = gps ? gps.status : undefined;
+      const info = { recName: rec.name, sheet: sm.name, itemLabel: A.itemLabel(sm, item) };
+      for (const file of files) {
+        try {
+          const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+          const id = U.uid('f'); let meta;
+          if (isPdf) {
+            if (file.size > MAX_PDF) { U.toast(`${file.name} is larger than 30 MB`, true); continue; }
+            const data = await file.arrayBuffer(); let pages = 0;
+            try { const L = await A.pdfLib(); const d = await L.PDFDocument.load(data, { ignoreEncryption: true }); pages = d.getPageCount(); } catch (e) { console.warn('pdf page count', e); }
+            await U.put('files', { id, rid: rec.id, type: 'application/pdf', data });
+            meta = { kind: 'pdf', type: 'application/pdf', size: data.byteLength, pages, hash: await U.sha256buf(data), thumb: pdfThumb(file.name, pages) };
+          } else {
+            b.set('Processing photo…');
+            const p = await processImage(file, info, gps);
+            await U.put('files', { id, rid: rec.id, type: p.type, data: p.data });
+            meta = { kind: 'image', type: p.type, size: p.data.byteLength, w: p.w, h: p.h, hash: await U.sha256buf(p.data), thumb: p.thumb, gps: gpsOk, gpsStatus };
+          }
+          const att = Object.assign({ id, sheet: sm.name, item, name: file.name || (meta.kind === 'pdf' ? 'document.pdf' : 'photo.jpg'), caption: '', comments: [], ts: Date.now(), user: U.settings().user || '', camera: !!ctx.camera }, meta);
+          A.all(rec).push(att); if (ctx.added) ctx.added.push(att);
+          n++;
+        } catch (e) { console.error(e); U.toast(`${file.name}: ${e.message}`, true); }
+      }
+    } finally { b.done(); }
+    return n;
+  };
+  function pickFiles(camera) {
+    return new Promise((res) => {
+      const inp = document.createElement('input'); inp.type = 'file'; inp.className = 'hidden';
+      if (camera) { inp.accept = 'image/*'; inp.setAttribute('capture', 'environment'); } else { inp.accept = 'image/*,application/pdf,.pdf'; inp.multiple = true; }
+      inp.onchange = () => { res([...inp.files]); inp.remove(); };
+      window.addEventListener('focus', function f() { window.removeEventListener('focus', f); setTimeout(() => { if (!inp.files || !inp.files.length) { res([]); inp.remove(); } }, 1500); });
+      document.body.appendChild(inp); inp.click();
+    });
+  }
+  /** Live in-browser camera (getUserMedia) - opens a real-time camera preview right inside
+   * SiteForms and lets the user snap one or more photos without ever leaving the app or
+   * touching the operating system's own photo picker. This is what actually solves "Take
+   * photo opens the gallery instead of the camera" on devices (Windows laptops/2-in-1s,
+   * some desktop browsers) where the plain HTML camera hint many phones honor isn't treated
+   * the same way. Resolves to an array of captured File objects, or null when this browser/
+   * context can't support it (no HTTPS, no camera API, permission blocked, or the offline
+   * single-file build opened via file://) so the caller can fall back to the OS picker. */
+  A.liveCapture = () => new Promise((resolve) => {
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { resolve(null); return; }
+    const shots = []; let stream = null;
+    const body = U.h(`<div>
+      <div style="position:relative;background:#000;border-radius:10px;overflow:hidden;max-height:62vh;display:flex;align-items:center;justify-content:center">
+        <video autoplay playsinline muted style="width:100%;max-height:62vh;display:block"></video>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+        <button type="button" class="btn" data-switch style="display:none">🔄 Switch camera</button>
+        <span class="small muted" data-camname></span>
+      </div>
+      <p class="small muted" style="margin-top:8px" data-shots>No photos captured yet this session.</p>
+    </div>`);
+    const video = body.querySelector('video'); const shotsLabel = body.querySelector('[data-shots]');
+    const sayCount = () => { shotsLabel.textContent = shots.length ? `${shots.length} photo${shots.length > 1 ? 's' : ''} captured this session.` : 'No photos captured yet this session.'; };
+    U.modal({
+      title: '📷 Take photo', body, wide: true, sticky: true,
+      buttons: [
+        { label: 'Done', value: true },
+        {
+          label: '📸 Capture', cls: 'primary',
+          onClick: async () => {
+            if (!video.videoWidth) { U.toast('Camera is still starting – try again in a moment', true); return false; }
+            const c = document.createElement('canvas'); c.width = video.videoWidth; c.height = video.videoHeight;
+            c.getContext('2d').drawImage(video, 0, 0);
+            const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.92));
+            shots.push(new File([blob], `camera-${Date.now()}-${shots.length + 1}.jpg`, { type: 'image/jpeg' }));
+            sayCount();
+            return false; // keep the modal open so the next required photo can be taken immediately
+          }
+        }
+      ],
+      onOpen: async () => {
+        /* Windows tablets (Surface Go etc.) often ignore facingMode, so pick the rear camera by its name,
+           remember the user's choice, and offer a Switch camera button. */
+        const KEY = 'sf.cameraId'; let cams = []; let idx = 0;
+        const switchBtn = body.querySelector('[data-switch]'); const camName = body.querySelector('[data-camname]');
+        const stop = () => { if (stream) stream.getTracks().forEach((t) => t.stop()); stream = null; };
+        const open = async (deviceId) => {
+          stop();
+          const v = deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: 'environment' } };
+          try { stream = await navigator.mediaDevices.getUserMedia({ video: Object.assign(v, { width: { ideal: 1920 }, height: { ideal: 1080 } }), audio: false }); }
+          catch (e) { try { stream = await navigator.mediaDevices.getUserMedia({ video: deviceId ? { deviceId: { exact: deviceId } } : true, audio: false }); } catch (e2) { stream = null; } }
+          if (stream) { video.srcObject = stream; const t = stream.getVideoTracks()[0]; camName.textContent = t && t.label ? 'Using: ' + t.label : ''; }
+          return !!stream;
+        };
+        if (!(await open(null))) { U.toast('Could not open the camera – permission denied or camera in use', true); return; }
+        try {
+          cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
+          const cur = stream.getVideoTracks()[0]; const curId = cur && cur.getSettings ? cur.getSettings().deviceId : '';
+          const saved = localStorage.getItem(KEY);
+          let want = cams.find((d) => d.deviceId === saved);
+          if (!want) want = cams.find((d) => /back|rear|environment|world/i.test(d.label));
+          if (!want && cams.length > 1 && cams.some((d) => /front|user|face/i.test(d.label))) want = cams.find((d) => !/front|user|face/i.test(d.label));
+          if (want && want.deviceId !== curId) await open(want.deviceId);
+          const nowId = stream && stream.getVideoTracks()[0].getSettings().deviceId;
+          idx = Math.max(0, cams.findIndex((d) => d.deviceId === nowId));
+          if (cams.length > 1) {
+            switchBtn.style.display = '';
+            switchBtn.onclick = async () => {
+              idx = (idx + 1) % cams.length;
+              if (await open(cams[idx].deviceId)) { try { localStorage.setItem(KEY, cams[idx].deviceId); } catch (e) {} }
+            };
+          }
+        } catch (e) { /* keep whatever camera opened */ }
+      }
+    }).then(() => { if (stream) stream.getTracks().forEach((t) => t.stop()); resolve(shots); });
+  });
+  /** opens camera / picker, stores, calls ctx.onChange(n) */
+  A.capture = async (ctx, camera) => {
+    let files = null;
+    if (camera) { files = await A.liveCapture(); if (files === null) files = await pickFiles(true); } // fall back to the OS picker only when live capture truly isn't possible
+    else files = await pickFiles(false);
+    if (!files || !files.length) return 0;
+    const added = [];
+    const n = await A.addFiles(Object.assign({}, ctx, { camera, added }), files);
+    if (n) {
+      U.toast(`${n} attachment${n > 1 ? 's' : ''} added`);
+      // save immediately (crash-safe), then ask for descriptions
+      ctx.onChange && await ctx.onChange(`Attached ${n} file${n > 1 ? 's' : ''} to ${ctx.sm.name}${ctx.item ? ' \u00b7 ' + A.itemLabel(ctx.sm, ctx.item).slice(0, 50) : ''}`);
+      if (U.settings().askDesc !== false) {
+        const msg = await A.describe(ctx, added);
+        if (msg && ctx.onChange) await ctx.onChange(msg);
+      }
+    }
+    return n;
+  };
+
+  /* ---------------- descriptions & comments ---------------- */
+  A.comments = (a) => (a.comments = Array.isArray(a.comments) ? a.comments : []);
+  A.ncom = (a) => (Array.isArray(a.comments) ? a.comments.length : 0);
+  const itemOpts = (sm, cur) => `<option value="">General (whole form)</option>${A.items(sm).map((it) => `<option value="${it.key}" ${String(cur == null ? '' : cur) === it.key ? 'selected' : ''}>${U.esc(it.label.slice(0, 90))}</option>`).join('')}`;
+  const PH = 'e.g. Rebar cover measured 3' + '&quot;' + ' at south wall, approved by inspector';
+
+  /** "Describe your upload(s)" modal shown after taking / uploading. returns history msg or null */
+  A.describe = async (ctx, atts) => {
+    atts = (atts || []).filter(Boolean); if (!atts.length) return null;
+    const body = U.h(`<div class="adesc">
+      <p class="small muted" style="margin-top:0">Add a description so anyone reviewing the form knows what ${atts.length > 1 ? 'each file shows' : 'this shows'}. It is saved with the form and printed under the ${atts.length > 1 ? 'photos' : 'photo'} in PDF, Excel and print exports.</p>
+      ${atts.map((a, i) => `<div class="adrow" data-i="${i}"><img src="${a.thumb}" alt=""><div class="adf">
+        <div class="small muted">${U.esc(a.name)} \u00b7 ${U.esc(U.fmtSize(a.size))}</div>
+        <textarea class="inp" rows="3" data-desc ${i === 0 ? 'autofocus' : ''} placeholder="${PH}">${U.esc(a.caption || '')}</textarea>
+        <select class="inp" data-item>${itemOpts(ctx.sm, a.item)}</select></div></div>`).join('')}
+      ${atts.length > 1 ? '<label class="small" style="display:flex;gap:6px;align-items:center;margin-top:6px"><input type="checkbox" data-same> Use the first description for all files</label>' : ''}
+      <label class="small muted" style="display:flex;gap:6px;align-items:center;margin-top:10px"><input type="checkbox" data-noask> Don\u2019t ask after every upload (you can still describe files by tapping them)</label></div>`);
+    const act = await U.modal({ title: atts.length > 1 ? `\ud83d\udcdd Describe ${atts.length} uploads` : '\ud83d\udcdd Describe this ' + (atts[0].kind === 'pdf' ? 'document' : 'photo'), body, wide: true, sticky: true,
+      buttons: [{ label: 'Skip', value: 'skip' }, { label: 'Save description' + (atts.length > 1 ? 's' : ''), cls: 'primary', value: 'save' }] });
+    if (body.querySelector('[data-noask]').checked) { const st = U.settings(); st.askDesc = false; U.saveSettings(st); U.toast('Description prompt turned off \u2013 turn it back on in Settings'); }
+    if (act !== 'save') return null;
+    const rows = [...body.querySelectorAll('.adrow')]; const same = body.querySelector('[data-same]');
+    const first = rows[0].querySelector('[data-desc]').value.trim(); let n = 0;
+    rows.forEach((row, i) => {
+      const a = atts[i]; const d = same && same.checked ? first : row.querySelector('[data-desc]').value.trim(); const it = row.querySelector('[data-item]').value;
+      if (d !== (a.caption || '') || it !== String(a.item || '')) { a.caption = d; a.item = it; n++; }
+    });
+    return n ? `Described ${n} attachment${n > 1 ? 's' : ''}` : null;
+  };
+
+  const comHtml = (a, canDel) => A.comments(a).length ? A.comments(a).map((c) => `<div class="acom" data-cid="${c.id}"><div class="acomh"><b>${U.esc(c.user || 'Unknown')}</b> <span class="muted">${U.esc(new Date(c.ts).toLocaleString())}</span>${canDel ? '<button type="button" class="btn ghost sm" data-cdel title="Remove comment">\u2715</button>' : ''}</div><div class="acomt">${U.esc(c.text)}</div></div>`).join('') : '<div class="muted small" data-none>No comments yet.</div>';
+
+  /* ---------------- UI ---------------- */
+  const metaLine = (a) => [U.fmtTs(a.ts), a.user, a.kind === 'pdf' ? (a.pages ? a.pages + ' pg' : 'PDF') : '', a.gps ? '📍' : ''].filter(Boolean).join(' · ');
+  A.thumb = (a, small) => { const nc = A.ncom(a); const tip = [a.caption || a.name, U.fmtTs(a.ts), nc ? nc + ' comment' + (nc > 1 ? 's' : '') : ''].filter(Boolean).join(' \u2013 ');
+    return `<button type="button" class="athumb ${small ? 'sm' : ''} ${a.kind}" data-att="${a.id}" title="${U.esc(tip)}"><img src="${a.thumb}" alt="">${nc ? `<span class="acnt" title="${nc} comment${nc > 1 ? 's' : ''}">\ud83d\udcac${nc}</span>` : ''}${small ? (a.caption ? '<span class="adot" title="Has description">\ud83d\udcdd</span>' : '') : `<span class="acap ${a.caption ? '' : 'none'}">${U.esc(a.caption || (a.kind === 'pdf' ? a.name : 'Add description\u2026'))}</span><span class="ameta">${U.esc(metaLine(a))}</span>`}</button>`; };
+
+  /** viewer modal */
+  A.view = async (ctx, att) => {
+    const locked = ctx.locked;
+    const body = U.h(`<div class="aview"><div class="aimg">${att.kind === 'pdf' ? `<img src="${att.thumb}" style="max-height:220px">` : '<div class="muted">Loading\u2026</div>'}</div>
+      <label>Description</label><textarea class="inp" id="acap" rows="3" ${locked ? 'readonly' : ''} placeholder="${PH}">${U.esc(att.caption || '')}</textarea>
+      <label>Linked to</label><select class="inp" id="aitem" ${locked ? 'disabled' : ''}>${itemOpts(ctx.sm, att.item)}</select>
+      <div class="small muted" style="margin-top:10px;line-height:1.6">${U.esc(att.name)} \u00b7 ${U.fmtSize(att.size)}${att.w ? ` \u00b7 ${att.w}\u00d7${att.h}` : ''}<br>${att.camera ? 'Taken with camera' : 'Uploaded'} ${U.esc(new Date(att.ts).toLocaleString())}${att.user ? ' by <b>' + U.esc(att.user) + '</b>' : ''}<br>${att.gps ? `Location ${att.gps.lat}, ${att.gps.lon} (\u00b1${att.gps.acc} m)<br>` : ''}Fingerprint <code>${U.esc(String(att.hash).slice(0, 24))}</code></div>
+      ${locked ? '<p class="small" style="color:var(--warn)">\ud83d\udd12 This form is signed \u2013 the file and description are locked. Comments can still be added.</p>' : ''}
+      <div class="acoms"><div class="row between"><label style="margin:0">\ud83d\udcac Comments <span class="tag" data-cn>${A.ncom(att)}</span></label></div>
+        <div class="acl">${comHtml(att, !locked)}</div>
+        <div class="acadd"><input class="inp" data-cuser placeholder="Your name" value="${U.esc(U.settings().user || '')}">
+          <textarea class="inp" rows="2" data-ctext placeholder="Add a comment \u2013 e.g. Reviewed, OK to pour / Re-shoot after cleanup"></textarea>
+          <button type="button" class="btn sm primary" data-cadd>\ud83d\udcac Add comment</button></div></div></div>`);
+    let url = null; let changed = false;
+    const blob = await A.blob(att);
+    if (blob) {
+      url = URL.createObjectURL(blob);
+      if (att.kind === 'image') body.querySelector('.aimg').innerHTML = `<img src="${url}" alt="">`;
+    }
+    const repaint = () => { body.querySelector('.acl').innerHTML = comHtml(att, !locked); body.querySelector('[data-cn]').textContent = A.ncom(att); };
+    const addComment = async () => {
+      const ta = body.querySelector('[data-ctext]'); const text = ta.value.trim(); if (!text) { ta.focus(); return; }
+      const user = body.querySelector('[data-cuser]').value.trim();
+      if (user && !U.settings().user) { const st = U.settings(); st.user = user; U.saveSettings(st); }
+      A.comments(att).push({ id: U.uid('c'), ts: Date.now(), user, text });
+      ta.value = ''; repaint();
+      if (ctx.onChange) await ctx.onChange(`Comment on ${att.caption ? att.caption.slice(0, 40) : att.name}${user ? ' by ' + user : ''}: ${text.slice(0, 60)}`);
+    };
+    body.addEventListener('click', async (e) => {
+      if (e.target.closest('[data-cadd]')) return addComment();
+      const d = e.target.closest('[data-cdel]');
+      if (d && !locked) {
+        const id = d.closest('[data-cid]').dataset.cid; const c = A.comments(att).find((x) => x.id === id); if (!c) return;
+        if (!(await U.confirm('Remove comment', `Remove this comment by <b>${U.esc(c.user || 'Unknown')}</b>?`, 'Remove', true))) return;
+        att.comments = A.comments(att).filter((x) => x !== c); repaint();
+        if (ctx.onChange) await ctx.onChange(`Removed comment on ${att.name}: ${c.text.slice(0, 60)}`);
+      }
+    });
+    body.querySelector('[data-ctext]').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); addComment(); } });
+    const buttons = [];
+    if (!locked) buttons.push({ label: 'Delete', cls: 'danger', value: 'del' });
+    buttons.push({ label: '\u2b07 Download', value: 'dl' });
+    if (att.kind === 'pdf') buttons.push({ label: 'Open PDF', value: 'open' });
+    buttons.push({ label: locked ? 'Close' : 'Save', cls: 'primary', value: 'save' });
+    const act = await U.modal({ title: att.kind === 'pdf' ? 'Document' : 'Photo', body, wide: true, buttons });
+    // an unsent comment typed in the box is kept rather than lost
+    if (act !== 'del' && body.querySelector('[data-ctext]').value.trim()) await addComment();
+    if ((act === 'save' || act === null) && !locked) {
+      const cap = body.querySelector('#acap').value.trim(), it = body.querySelector('#aitem').value;
+      if (cap !== (att.caption || '') || it !== String(att.item || '')) { att.caption = cap; att.item = it; changed = 'Updated attachment ' + att.name + (cap ? ' \u2013 ' + cap.slice(0, 60) : ''); }
+    } else if (act === 'dl' && blob) U.download(blob, att.name.replace(/\.[^.]+$/, '') + (att.kind === 'pdf' ? '.pdf' : '.jpg'));
+    else if (act === 'open' && url) { window.open(url, '_blank'); url = null; }
+    else if (act === 'del' && !locked) {
+      if (await U.confirm('Delete attachment', `Delete <b>${U.esc(att.caption || att.name)}</b>?`, 'Delete', true)) {
+        ctx.rec.att = A.all(ctx.rec).filter((x) => x !== att); await U.del('files', att.id); changed = 'Deleted attachment ' + att.name;
+      }
+    }
+    if (url) setTimeout(() => URL.revokeObjectURL(url), 60000);
+    if (changed && ctx.onChange) await ctx.onChange(changed);
+  };
+
+  /** item / general dialog: thumbnails + add buttons */
+  A.dialog = async (ctx) => {
+    const { rec, sm } = ctx; const item = ctx.item == null ? '' : String(ctx.item);
+    const close = await new Promise((resolve) => {
+      const body = U.h('<div class="adlg"></div>');
+      const paint = () => {
+        const list = A.list(rec, sm.name, item); const need = item ? A.needItem(ctx.tpl, rec, sm, item) : false;
+        body.innerHTML = `<p class="muted" style="margin-top:0">${U.esc(A.itemLabel(sm, item))}</p>
+          ${need ? '<div class="banner warn" style="margin:0 0 10px">📷 A photo is required for this item before the form can be signed.</div>' : ''}
+          <div class="agrid">${list.map((a) => A.thumb(a)).join('') || '<div class="muted small" style="padding:14px 0">No photos or documents yet.</div>'}</div>
+          ${ctx.locked ? '<p class="small" style="color:var(--warn)">🔒 Form is signed – attachments are locked.</p>' : `<div class="row" style="margin-top:12px"><button class="btn primary" data-cam>📷 Take photo</button><button class="btn" data-up>⬆ Upload photo / PDF</button></div>`}`;
+      };
+      const sub = Object.assign({}, ctx, { item, onChange: async (m) => { await ctx.onChange(m); paint(); } });
+      body.addEventListener('click', async (e) => {
+        if (e.target.closest('[data-cam]')) return A.capture(sub, true);
+        if (e.target.closest('[data-up]')) return A.capture(sub, false);
+        const t = e.target.closest('[data-att]'); if (t) { const a = A.all(rec).find((x) => x.id === t.dataset.att); if (a) await A.view(sub, a); }
+      });
+      paint();
+      U.modal({ title: '📷 Photos & documents', body, wide: true, buttons: [{ label: 'Done', cls: 'primary', value: true }] }).then(resolve);
+    });
+    return close;
+  };
+
+  /** panel listing all attachments of a form */
+  A.panel = (ctx) => {
+    const { rec, sm } = ctx;
+    const el = document.createElement('div'); el.className = 'apanel'; el.id = 'apanel';
+    const paint = () => {
+      const list = A.list(rec, sm.name); const miss = A.missing(ctx.tpl, rec, sm); const rule = A.rule(sm);
+      const groups = {}; list.forEach((a) => { (groups[a.item || ''] = groups[a.item || ''] || []).push(a); });
+      const keys = Object.keys(groups).sort((x, y) => (x === '' ? -1 : y === '' ? 1 : +x - +y));
+      const rules = [rule.min ? `at least ${rule.min} per form` : '', rule.yes ? 'one for every item marked YES' : '', Object.keys(rule.rows).length ? `${Object.keys(rule.rows).length} specific item(s)` : ''].filter(Boolean);
+      el.innerHTML = `<div class="row between"><h3 style="margin:0">📷 Photos &amp; documents <span class="tag">${list.length}</span></h3>
+        ${ctx.locked ? '<span class="small muted">🔒 locked (signed)</span>' : '<div class="row"><button class="btn primary sm" data-cam>📷 Take photo</button><button class="btn sm" data-up>⬆ Upload photo / PDF</button></div>'}</div>
+        <p class="small muted" style="margin:6px 0 10px">Attach site photos or PDFs (test reports, tickets, drawings) as verification. ${rules.length ? '<b>Required evidence:</b> ' + rules.join(', ') + '.' : 'Use the 📷 button beside any checklist item to link a photo to that item.'}</p>
+        ${miss.length ? `<div class="banner warn" style="margin:0 0 10px">Missing evidence: ${miss.map((m) => U.esc(m.msg)).join(' · ')}</div>` : ''}
+        ${keys.map((k) => `<div class="agrp"><div class="agh">${U.esc(A.itemLabel(sm, k))}</div><div class="agrid">${groups[k].map((a) => A.thumb(a)).join('')}</div></div>`).join('') || '<div class="muted small">No attachments on this form yet.</div>'}`;
+    };
+    const sub = Object.assign({}, ctx, { item: '' });
+    el.addEventListener('click', async (e) => {
+      if (e.target.closest('[data-cam]')) return A.capture(sub, true);
+      if (e.target.closest('[data-up]')) return A.capture(sub, false);
+      const t = e.target.closest('[data-att]'); if (t) { const a = A.all(rec).find((x) => x.id === t.dataset.att); if (a) await A.view(ctx, a); }
+    });
+    paint(); el._paint = paint;
+    return el;
+  };
+
+  /** camera buttons in a gutter to the right of each checklist row (form view) */
+  A.gutter = (sheetEl, ctx) => {
+    const { rec, sm } = ctx; const items = A.items(sm); if (!items.length) return 0;
+    const top = []; let y = 0; for (let r = 1; r <= sm.nr; r++) { top[r] = y; y += sm.rowH[r] === undefined ? 20 : sm.rowH[r]; }
+    const g = R.geom(sm);
+    sheetEl.style.width = (g.width + 46) + 'px'; sheetEl.classList.add('hasgut');
+    items.forEach((it) => {
+      const m = sm.merges.find((mm) => it.r >= mm.r1 && it.r <= mm.r2 && Object.values(sm.fields).some((f) => f.row === it.r && f.c >= mm.c1 && f.c <= mm.c2));
+      const r1 = m ? m.r1 : it.r, r2 = m ? m.r2 : it.r; const hh = top[r2] + (sm.rowH[r2] === undefined ? 20 : sm.rowH[r2]) - top[r1];
+      const n = A.list(rec, sm.name, it.key).length; const need = A.needItem(ctx.tpl, rec, sm, it.key);
+      const b = document.createElement('button'); b.type = 'button';
+      b.className = 'pcam' + (n ? ' has' : '') + (need ? ' need' : '');
+      b.title = (need ? 'Photo required – ' : 'Photos – ') + it.label;
+      b.style.cssText = `left:${g.width + 6}px;top:${top[r1] + Math.max(0, (hh - 30) / 2)}px`;
+      b.innerHTML = `📷${n ? `<b>${n}</b>` : ''}`;
+      b.onclick = () => A.dialog(Object.assign({}, ctx, { item: it.key }));
+      sheetEl.appendChild(b);
+    });
+    return items.length;
+  };
+  /** strips inside checklist (list) view */
+  A.strips = (listEl, ctx) => {
+    const { rec, sm } = ctx;
+    listEl.querySelectorAll('.litem[data-row]').forEach((li) => {
+      const key = li.dataset.row; const list = A.list(rec, sm.name, key); const need = A.needItem(ctx.tpl, rec, sm, key);
+      const s = U.h(`<div class="astrip ${need ? 'need' : ''}">${list.map((a) => A.thumb(a, true)).join('')}<button type="button" class="btn sm ${need ? 'danger' : ''}" data-add ${ctx.locked ? 'disabled' : ''}>📷 ${list.length ? 'Add' : need ? 'Photo required' : 'Add photo'}</button></div>`);
+      s.addEventListener('click', async (e) => {
+        if (e.target.closest('[data-add]')) return A.dialog(Object.assign({}, ctx, { item: key }));
+        const t = e.target.closest('[data-att]'); if (t) { const a = A.all(rec).find((x) => x.id === t.dataset.att); if (a) await A.view(ctx, a); }
+      });
+      li.appendChild(s);
+    });
+  };
+
+  root.Attach = A;
+})(window);
